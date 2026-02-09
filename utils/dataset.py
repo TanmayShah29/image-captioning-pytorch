@@ -98,55 +98,88 @@ class FlickrDataset(Dataset):
             
         Note: Each image has 5 captions (#0 to #4)
         """
-        imgs = []
-        captions = []
+        all_imgs = []
+        all_captions = []
         
-        print(f"\n[DEBUG] Loading captions from: {captions_file}")
-        print(f"[DEBUG] File exists: {os.path.exists(captions_file)}")
+        print(f"\n{'='*60}")
+        print(f"LOADING DATASET")
+        print(f"{'='*60}")
+        print(f"Captions file: {captions_file}")
+        print(f"Image directory: {self.root_dir}")
+        print(f"File exists: {os.path.exists(captions_file)}")
         
         if not os.path.exists(captions_file):
             print(f"[ERROR] Captions file not found: {captions_file}")
-            return imgs, captions
+            return all_imgs, all_captions
         
         line_count = 0
-        skipped_lines = 0
+        skipped_format = 0
         
+        # First pass: Load ALL captions from file
         with open(captions_file, 'r', encoding='utf-8') as f:
             for line in f:
                 line_count += 1
                 
                 # Skip empty lines
                 if not line.strip():
-                    skipped_lines += 1
                     continue
                 
-                # Split line into image_id and caption
+                # Split line into image_id and caption using TAB
                 # Format: "image.jpg#0\tCaption text"
                 parts = line.strip().split('\t')
                 
                 if len(parts) != 2:
-                    skipped_lines += 1
-                    if line_count <= 5:  # Show first few problematic lines
-                        print(f"[DEBUG] Line {line_count} skipped (parts={len(parts)}): {line[:100]}")
+                    skipped_format += 1
+                    if skipped_format <= 3:  # Show first few problematic lines
+                        print(f"[WARNING] Line {line_count} has {len(parts)} parts (expected 2): {line[:80]}")
                     continue
                 
                 # Extract image filename (remove #0, #1, etc.)
                 img_id = parts[0].split('#')[0]
-                caption = parts[1]
+                caption = parts[1].strip()
                 
-                imgs.append(img_id)
+                # Add to lists
+                all_imgs.append(img_id)
+                all_captions.append(caption)
+        
+        print(f"\n--- Caption Loading Results ---")
+        print(f"Total lines read: {line_count}")
+        print(f"Lines with format issues: {skipped_format}")
+        print(f"Total captions loaded: {len(all_captions)}")
+        print(f"Unique images referenced: {len(set(all_imgs))}")
+        
+        if len(all_captions) == 0:
+            print("\n[ERROR] No captions were loaded!")
+            print("Check that file format is: image.jpg#0<TAB>caption text")
+            return all_imgs, all_captions
+        
+        # Second pass: Filter by image existence
+        imgs = []
+        captions = []
+        missing_images = set()
+        
+        for img_name, caption in zip(all_imgs, all_captions):
+            img_path = os.path.join(self.root_dir, img_name)
+            if os.path.exists(img_path):
+                imgs.append(img_name)
                 captions.append(caption)
+            else:
+                missing_images.add(img_name)
         
-        print(f"[DEBUG] Total lines read: {line_count}")
-        print(f"[DEBUG] Lines skipped: {skipped_lines}")
-        print(f"[DEBUG] Captions loaded: {len(captions)}")
-        print(f"[DEBUG] Unique images: {len(set(imgs))}")
+        print(f"\n--- Image Verification Results ---")
+        print(f"Images found: {len(set(imgs))}")
+        print(f"Images missing: {len(missing_images)}")
+        print(f"Final dataset size: {len(imgs)} image-caption pairs")
         
-        if len(captions) > 0:
-            print(f"[DEBUG] First caption: {captions[0][:80]}...")
-            print(f"[DEBUG] First image: {imgs[0]}")
-        else:
-            print("[WARNING] No captions were loaded! Check file format.")
+        if len(missing_images) > 0 and len(missing_images) <= 5:
+            print(f"Missing images: {list(missing_images)[:5]}")
+        
+        if len(imgs) > 0:
+            print(f"\n--- Sample Data ---")
+            print(f"First image: {imgs[0]}")
+            print(f"First caption: {captions[0][:80]}...")
+        
+        print(f"{'='*60}\n")
         
         return imgs, captions
     
