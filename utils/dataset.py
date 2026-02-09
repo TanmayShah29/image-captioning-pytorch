@@ -60,7 +60,26 @@ class FlickrDataset(Dataset):
         # Load all image-caption pairs
         self.imgs, self.captions = self.load_captions(captions_file)
         
+        # Validate that captions were loaded
+        if len(self.captions) == 0:
+            raise ValueError(
+                f"\n{'='*60}\n"
+                f"ERROR: No captions were loaded from {captions_file}\n"
+                f"{'='*60}\n"
+                f"Possible causes:\n"
+                f"1. File is empty or doesn't exist\n"
+                f"2. File format is incorrect (should be: image.jpg#0<TAB>caption)\n"
+                f"3. File encoding issue (should be UTF-8)\n"
+                f"\nExpected format:\n"
+                f"  1000268201_693b08cb0e.jpg#0<TAB>A child in a pink dress climbing stairs\n"
+                f"  1000268201_693b08cb0e.jpg#1<TAB>A girl going into a wooden building\n"
+                f"\nPlease check the file and try again.\n"
+                f"{'='*60}\n"
+            )
+        
         print(f"Dataset loaded: {len(self.imgs)} image-caption pairs")
+        print(f"Unique images: {len(set(self.imgs))}")
+
     
     def load_captions(self, captions_file):
         """
@@ -82,13 +101,33 @@ class FlickrDataset(Dataset):
         imgs = []
         captions = []
         
-        with open(captions_file, 'r') as f:
+        print(f"\n[DEBUG] Loading captions from: {captions_file}")
+        print(f"[DEBUG] File exists: {os.path.exists(captions_file)}")
+        
+        if not os.path.exists(captions_file):
+            print(f"[ERROR] Captions file not found: {captions_file}")
+            return imgs, captions
+        
+        line_count = 0
+        skipped_lines = 0
+        
+        with open(captions_file, 'r', encoding='utf-8') as f:
             for line in f:
+                line_count += 1
+                
+                # Skip empty lines
+                if not line.strip():
+                    skipped_lines += 1
+                    continue
+                
                 # Split line into image_id and caption
                 # Format: "image.jpg#0\tCaption text"
                 parts = line.strip().split('\t')
                 
                 if len(parts) != 2:
+                    skipped_lines += 1
+                    if line_count <= 5:  # Show first few problematic lines
+                        print(f"[DEBUG] Line {line_count} skipped (parts={len(parts)}): {line[:100]}")
                     continue
                 
                 # Extract image filename (remove #0, #1, etc.)
@@ -97,6 +136,17 @@ class FlickrDataset(Dataset):
                 
                 imgs.append(img_id)
                 captions.append(caption)
+        
+        print(f"[DEBUG] Total lines read: {line_count}")
+        print(f"[DEBUG] Lines skipped: {skipped_lines}")
+        print(f"[DEBUG] Captions loaded: {len(captions)}")
+        print(f"[DEBUG] Unique images: {len(set(imgs))}")
+        
+        if len(captions) > 0:
+            print(f"[DEBUG] First caption: {captions[0][:80]}...")
+            print(f"[DEBUG] First image: {imgs[0]}")
+        else:
+            print("[WARNING] No captions were loaded! Check file format.")
         
         return imgs, captions
     
