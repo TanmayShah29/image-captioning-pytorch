@@ -13,7 +13,7 @@ End-to-end image captioning on **Flickr8k** using a CNN–LSTM architecture (Res
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Local)
 
 ### 1. Install dependencies
 
@@ -77,8 +77,7 @@ data/
 └── captions.txt      ← image_name<TAB>caption
 ```
 
-> [!NOTE]
-> Once prepared, re-running skips the normalization step (fast path).
+> **Note:** Once prepared, re-running skips the normalization step (fast path).
 
 ---
 
@@ -148,6 +147,358 @@ python verify.py
 # Dataset-only dry run (5 samples)
 python test_dataset_loading.py
 ```
+
+---
+
+# Google Colab Setup Guide
+
+Complete setup instructions for running this image captioning project in Google Colab.
+
+## ⚡ Quick Start (All-in-One Setup)
+
+### Prerequisites
+1. **Enable GPU**: Runtime → Change runtime type → T4 GPU → Save
+2. **Get Kaggle API credentials**: 
+   - Go to [kaggle.com](https://www.kaggle.com) → Settings → API → Create New Token
+   - This downloads `kaggle.json`
+
+---
+
+## 🚀 Setup Cells (Run in Order)
+
+### Cell 1: Mount Drive & Check GPU
+```python
+# ==========================================
+# CELL 1: MOUNT DRIVE & CHECK GPU
+# ==========================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import torch
+print(f"GPU available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("⚠️ WARNING: GPU not enabled! Go to Runtime → Change runtime type → GPU")
+```
+
+**Expected output:**
+```
+GPU available: True
+GPU: Tesla T4
+```
+
+---
+
+### Cell 2: Upload Kaggle Credentials
+```python
+# ==========================================
+# CELL 2: UPLOAD KAGGLE.JSON
+# ==========================================
+
+from google.colab import files
+
+print("Upload your kaggle.json file:")
+uploaded = files.upload()
+
+!mkdir -p ~/.kaggle
+!cp kaggle.json ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+
+# Test Kaggle API
+!kaggle datasets list -s flickr | head -5
+
+print("✓ Kaggle configured!")
+```
+
+**Action required:** Click "Choose Files" and select your `kaggle.json`
+
+---
+
+### Cell 3: Clone Repository
+```python
+# ==========================================
+# CELL 3: CLONE REPOSITORY
+# ==========================================
+
+%cd /content
+!git clone https://github.com/TanmayShah29/image-captioning-pytorch.git
+%cd image-captioning-pytorch
+
+!ls -la
+```
+
+---
+
+### Cell 4: Install Dependencies
+```python
+# ==========================================
+# CELL 4: INSTALL DEPENDENCIES
+# ==========================================
+
+!pip install -q -r requirements.txt
+
+import nltk
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+print("✓ Dependencies installed")
+```
+
+---
+
+### Cell 5: Download Flickr8k Dataset
+```python
+# ==========================================
+# CELL 5: DOWNLOAD FLICKR8K DATASET
+# ==========================================
+
+!mkdir -p data
+
+# Download from Kaggle (~1GB, takes 2-3 minutes)
+!kaggle datasets download -d adityajn105/flickr8k
+
+# Check download
+!ls -lh flickr8k.zip
+
+# Extract
+!unzip -q flickr8k.zip -d data/
+
+# Verify extraction
+!ls -la data/
+!find data/ -type f | head -20
+```
+
+**Expected:** Should show `captions.txt` and `Images/` directory
+
+---
+
+### Cell 6: Fix Caption Format
+```python
+# ==========================================
+# CELL 6: FIX CAPTION FORMAT
+# ==========================================
+
+import pandas as pd
+
+# Read CSV format
+df = pd.read_csv('data/captions.txt')
+print(f"Loaded {len(df)} captions")
+
+# Convert to tab-separated format (required by the code)
+with open('data/captions_fixed.txt', 'w', encoding='utf-8') as f:
+    for _, row in df.iterrows():
+        f.write(f"{row['image']}\t{row['caption']}\n")
+
+# Backup original and replace
+!mv data/captions.txt data/captions_original.txt  
+!mv data/captions_fixed.txt data/captions.txt
+
+print("✓ Captions converted to tab-separated format")
+!head -5 data/captions.txt
+```
+
+**Expected output:** Tab-separated format without CSV header
+
+> **Note:** The auto-preparation pipeline (`prepare_dataset.py`) can handle CSV format automatically, but this manual step ensures the cleanest setup.
+
+---
+
+### Cell 7: Setup Checkpoints to Google Drive
+```python
+# ==========================================
+# CELL 7: SETUP CHECKPOINT DIRECTORY
+# ==========================================
+
+!mkdir -p /content/drive/MyDrive/image_captioning_checkpoints
+
+# Update config to save checkpoints to Drive (persists after disconnect)
+!sed -i 's|saved_models|/content/drive/MyDrive/image_captioning_checkpoints|g' config.yaml
+
+# Verify
+!grep save_dir config.yaml
+
+print("✓ Checkpoints will save to Google Drive")
+```
+
+**Why?** Colab sessions disconnect after 12 hours. Saving to Drive prevents data loss.
+
+---
+
+### Cell 8: Test Dataset Loading
+```python
+# ==========================================
+# CELL 8: TEST DATASET LOADING
+# ==========================================
+
+!python test_dataset_loading.py
+```
+
+**Expected:** Should show ✅ for all checks and confirm 8091 images, 40455 captions
+
+---
+
+### Cell 9: Start Training 🚀
+```python
+# ==========================================
+# CELL 9: START TRAINING
+# ==========================================
+
+!python train.py --num_epochs 5 --batch_size 16
+```
+
+**Training time:**
+- Per epoch: ~5-10 minutes (on T4 GPU)
+- Total (5 epochs): ~25-50 minutes
+
+**What to expect:**
+```
+Device: cuda  |  AMP: True
+Epoch 1/5: 100%|██████████| 1770/1770 [06:23<00:00]
+Train Loss: 3.1234  |  Val Loss: 2.8765
+```
+
+---
+
+### Cell 10: Monitor GPU (Optional)
+```python
+# ==========================================
+# CELL 10: MONITOR GPU USAGE
+# ==========================================
+
+!nvidia-smi
+```
+
+Run this in a separate cell while training to monitor GPU memory and utilization.
+
+---
+
+## 🔄 Quick Restore (For Future Sessions)
+
+After your first successful setup, save the dataset to Drive to avoid re-downloading:
+
+```python
+# ONE-TIME: Save dataset to Drive after first setup
+!cp -r /content/image-captioning-pytorch/data /content/drive/MyDrive/flickr8k_backup
+```
+
+**For future sessions, use this fast restore:**
+
+```python
+# ==========================================
+# QUICK RESTORE (replaces Cells 3-6)
+# ==========================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+%cd /content
+!git clone https://github.com/TanmayShah29/image-captioning-pytorch.git
+%cd image-captioning-pytorch
+
+!pip install -q -r requirements.txt
+
+# Restore dataset from Drive (much faster than re-downloading)
+!cp -r /content/drive/MyDrive/flickr8k_backup/* data/
+
+# Point checkpoints to Drive
+!sed -i 's|saved_models|/content/drive/MyDrive/image_captioning_checkpoints|g' config.yaml
+
+# Download NLTK data
+import nltk
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+print("✓ Quick restore complete! Ready to train.")
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+### Issue 1: "CUDA out of memory"
+**Solution:** Reduce batch size
+```python
+!python train.py --num_epochs 5 --batch_size 8  # or even 4
+```
+
+### Issue 2: "Device: cpu | AMP: False"
+**Solution:** GPU not enabled
+1. Runtime → Change runtime type
+2. Hardware accelerator → T4 GPU
+3. Save → Runtime will restart
+
+### Issue 3: Session disconnected during training
+**Solution:** Resume from checkpoint
+```python
+!python train.py --resume /content/drive/MyDrive/image_captioning_checkpoints/checkpoint_latest.pth
+```
+
+### Issue 4: "No such file or directory: data/captions.txt"
+**Solution:** Re-run Cell 5 (dataset download) and Cell 6 (format conversion)
+
+### Issue 5: Kaggle API authentication error
+**Solution:** Re-upload kaggle.json
+- Make sure you downloaded it from kaggle.com → Settings → API
+- Re-run Cell 2
+
+---
+
+## 📊 After Training
+
+### Generate Captions
+```python
+!python inference.py --image data/images/1000268201_693b08cb0e.jpg --beam_size 3
+```
+
+### Evaluate Model (BLEU Scores)
+```python
+!python evaluate.py
+```
+
+### Download Trained Model
+```python
+from google.colab import files
+
+# Download best model
+files.download('/content/drive/MyDrive/image_captioning_checkpoints/best_model.pth')
+
+# Download vocabulary
+files.download('/content/drive/MyDrive/image_captioning_checkpoints/vocabulary.pkl')
+```
+
+---
+
+## 💡 Tips
+
+1. **Enable GPU before starting** - Training on CPU takes 10-20x longer
+2. **Save dataset to Drive** - Saves 5-10 minutes on future runs
+3. **Monitor GPU usage** - Run `!nvidia-smi` to check memory
+4. **Use beam search** - Beam size 3-5 produces better captions than greedy
+5. **Reduce batch size if OOM** - Start with 16, reduce to 8 or 4 if needed
+6. **Checkpoints auto-save** - Training can be resumed after disconnect
+
+---
+
+## 📈 Expected Results
+
+After 5 epochs:
+- **Training Loss**: ~2.0-2.5
+- **Validation Loss**: ~2.3-2.8
+- **BLEU-1**: ~0.55-0.65
+- **BLEU-4**: ~0.15-0.25
+
+For better results, train for 10-15 epochs.
+
+---
+
+## 🔗 Resources
+
+- [Flickr8k Dataset](https://www.kaggle.com/datasets/adityajn105/flickr8k)
+- [Original Repository](https://github.com/TanmayShah29/image-captioning-pytorch)
+- [Google Colab](https://colab.research.google.com/)
+- [Kaggle API Setup](https://github.com/Kaggle/kaggle-api)
 
 ---
 

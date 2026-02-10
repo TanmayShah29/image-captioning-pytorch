@@ -200,7 +200,7 @@ def train_model(cfg, resume_path=None):
     optimizer = torch.optim.Adam(decoder.parameters(), lr=cfg["learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=cfg["scheduler_patience"],
-        factor=0.5, verbose=True)
+        factor=0.5)
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     start_epoch = 0
