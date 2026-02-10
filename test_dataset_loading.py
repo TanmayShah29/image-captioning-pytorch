@@ -1,175 +1,131 @@
 """
-Diagnostic Test for Flickr8k Dataset Loading
+Dataset Dry-Run Test
+====================
+Validates the entire data pipeline without training:
 
-This script tests the caption loading functionality and provides
-detailed diagnostics to help identify any issues.
+  1. Run prepare_dataset() to normalize data
+  2. Load canonical captions.txt
+  3. Build vocabulary
+  4. Load at least 5 image–caption pairs
+  5. Open images with PIL
+  6. Print sample captions
 
-Run this before training to verify your dataset is loaded correctly.
+Exits 0 ONLY if everything is valid.
 """
 
 import os
 import sys
+import torch
+from PIL import Image
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+from utils.prepare_dataset import prepare_dataset, DatasetError
+from utils.dataset import load_caption_map, get_transform, FlickrDataset
 from utils.vocabulary import Vocabulary
-from utils.dataset import FlickrDataset, get_transform
 
-print("=" * 70)
-print("FLICKR8K DATASET LOADING DIAGNOSTIC TEST")
-print("=" * 70)
 
-# Configuration
-data_dir = "data"
-img_dir = os.path.join(data_dir, "Flickr8k_Dataset")
-captions_file = os.path.join(data_dir, "Flickr8k_text", "Flickr8k.token.txt")
+def run_test(data_root="data", num_samples=5):
+    """Run dry-run dataset loading test."""
 
-print("\n" + "=" * 70)
-print("STEP 1: Checking File Paths")
-print("=" * 70)
+    print("=" * 64)
+    print("  DATASET DRY-RUN TEST")
+    print("=" * 64)
 
-print(f"\nImage directory: {img_dir}")
-print(f"  Exists: {os.path.exists(img_dir)}")
-if os.path.exists(img_dir):
-    num_images = len([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
-    print(f"  Number of .jpg files: {num_images}")
+    # ------------------------------------------------------------------
+    # 1. Prepare dataset (auto-detect, normalize, validate)
+    # ------------------------------------------------------------------
+    print("\n✦ Step 1: Dataset preparation")
+    try:
+        stats = prepare_dataset(data_root)
+    except DatasetError as e:
+        print(str(e))
+        return False
 
-print(f"\nCaptions file: {captions_file}")
-print(f"  Exists: {os.path.exists(captions_file)}")
-if os.path.exists(captions_file):
-    with open(captions_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    print(f"  Total lines: {len(lines)}")
-    print(f"\n  First 3 lines:")
-    for i, line in enumerate(lines[:3]):
-        # Show with visible tab character
-        display_line = line.strip().replace('\t', '<TAB>')
-        print(f"    {i+1}: {display_line[:100]}")
+    img_dir = stats["images_dir"]
+    captions_file = stats["captions_file"]
 
-if not os.path.exists(img_dir):
-    print("\n" + "=" * 70)
-    print("ERROR: Image directory not found!")
-    print("=" * 70)
-    print("\nPlease ensure images are in: data/Flickr8k_Dataset/")
-    print("Download from: https://www.kaggle.com/datasets/adityajn105/flickr8k")
-    sys.exit(1)
+    # ------------------------------------------------------------------
+    # 2. Load canonical captions
+    # ------------------------------------------------------------------
+    print("\n✦ Step 2: Load captions")
+    caption_map = load_caption_map(captions_file)
+    total_imgs = len(caption_map)
+    total_caps = sum(len(v) for v in caption_map.values())
+    print(f"  Loaded {total_imgs} images, {total_caps} captions")
 
-if not os.path.exists(captions_file):
-    print("\n" + "=" * 70)
-    print("ERROR: Captions file not found!")
-    print("=" * 70)
-    print("\nPlease ensure captions file is in: data/Flickr8k_text/Flickr8k.token.txt")
-    sys.exit(1)
+    if total_caps == 0:
+        print("  ❌ FAIL: Zero captions loaded")
+        return False
+    print("  ✅ PASS")
 
-print("\n" + "=" * 70)
-print("STEP 2: Building Vocabulary")
-print("=" * 70)
+    # ------------------------------------------------------------------
+    # 3. Build vocabulary
+    # ------------------------------------------------------------------
+    print("\n✦ Step 3: Build vocabulary")
+    all_captions = [c for caps in caption_map.values() for c in caps]
+    vocab = Vocabulary(freq_threshold=5)
+    vocab.build_vocabulary(all_captions)
+    print(f"  Vocabulary size: {len(vocab)} words")
 
-# Load all captions for vocabulary
-all_captions = []
-with open(captions_file, 'r', encoding='utf-8') as f:
-    for line in f:
-        parts = line.strip().split('\t')
-        if len(parts) == 2:
-            all_captions.append(parts[1])
+    for token in ["<pad>", "<start>", "<end>", "<unk>"]:
+        assert token in vocab.word2idx, f"Missing required token: {token}"
+    print("  ✅ PASS — All special tokens present")
 
-print(f"\nCaptions extracted for vocabulary: {len(all_captions)}")
+    # ------------------------------------------------------------------
+    # 4. Load image–caption pairs + open images with PIL
+    # ------------------------------------------------------------------
+    print(f"\n✦ Step 4: Load & validate {num_samples} samples")
+    ds = FlickrDataset(img_dir, caption_map, vocab,
+                       transform=get_transform(train=False))
 
-if len(all_captions) == 0:
-    print("\n" + "=" * 70)
-    print("ERROR: No captions extracted!")
-    print("=" * 70)
-    print("\nThe file format may be incorrect.")
-    print("Expected format: image.jpg#0<TAB>caption text")
-    print("\nPlease check the file format and encoding.")
-    sys.exit(1)
+    if len(ds) < num_samples:
+        print(f"  ❌ FAIL: Dataset has only {len(ds)} samples (need {num_samples})")
+        return False
 
-# Build vocabulary
-vocab = Vocabulary(freq_threshold=5)
-vocab.build_vocabulary(all_captions)
+    for i in range(num_samples):
+        img_name, caption_text = ds.samples[i]
+        img_path = os.path.join(img_dir, img_name)
 
-print(f"Vocabulary size: {len(vocab)}")
-print(f"Sample words: {list(vocab.word2idx.keys())[:10]}")
+        # Open with PIL (raw, no transform)
+        try:
+            pil_img = Image.open(img_path).convert("RGB")
+            w, h = pil_img.size
+        except Exception as e:
+            print(f"  ❌ FAIL: Cannot open {img_name}: {e}")
+            return False
 
-print("\n" + "=" * 70)
-print("STEP 3: Creating Dataset")
-print("=" * 70)
+        # Also test the __getitem__ path (transform + numericalize)
+        image_tensor, caption_tensor = ds[i]
+        assert image_tensor.shape == (3, 224, 224), f"Bad image shape: {image_tensor.shape}"
+        assert len(caption_tensor.shape) == 1, f"Bad caption shape: {caption_tensor.shape}"
 
-try:
-    dataset = FlickrDataset(
-        root_dir=img_dir,
-        captions_file=captions_file,
-        vocab=vocab,
-        transform=get_transform(train=True)
-    )
-    
-    print(f"\n✓ Dataset created successfully!")
-    print(f"✓ Dataset length: {len(dataset)}")
-    
-except ValueError as e:
-    print(f"\n✗ Dataset creation failed!")
-    print(str(e))
-    sys.exit(1)
+        print(f"  [{i+1}] {img_name}")
+        print(f"      Image  : {w}×{h} → tensor {tuple(image_tensor.shape)}")
+        print(f"      Caption: {caption_text[:80]}")
 
-print("\n" + "=" * 70)
-print("STEP 4: Testing Sample Loading")
-print("=" * 70)
+    print(f"\n  ✅ PASS — All {num_samples} samples valid")
 
-try:
-    # Load first sample
-    image, caption = dataset[0]
-    
-    print(f"\n✓ Successfully loaded sample!")
-    print(f"  Image shape: {image.shape}")
-    print(f"  Caption shape: {caption.shape}")
-    print(f"  Caption (indices): {caption[:15].tolist()}...")
-    
-    # Decode caption
-    decoded_words = []
-    for idx in caption:
-        idx_val = idx.item()
-        if idx_val in vocab.idx2word:
-            word = vocab.idx2word[idx_val]
-            if word == '<end>':
-                break
-            if word not in ['<start>', '<pad>']:
-                decoded_words.append(word)
-    
-    print(f"  Caption (text): {' '.join(decoded_words)}")
-    
-except Exception as e:
-    print(f"\n✗ Sample loading failed!")
-    print(f"  Error: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+    # ------------------------------------------------------------------
+    # 5. Summary
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  ✅ DRY-RUN TEST PASSED")
+    print("=" * 64)
+    print(f"  Images         : {total_imgs}")
+    print(f"  Captions       : {total_caps}")
+    print(f"  Vocabulary     : {len(vocab)} words")
+    print(f"  Dataset samples: {len(ds)}")
+    print(f"  Canonical dir  : {img_dir}")
+    print(f"  Canonical file : {captions_file}")
+    print("=" * 64)
+    return True
 
-print("\n" + "=" * 70)
-print("STEP 5: Validation Summary")
-print("=" * 70)
 
-print(f"\n✓ All checks passed!")
-print(f"\nDataset Statistics:")
-print(f"  Total captions: {len(all_captions)}")
-print(f"  Dataset size: {len(dataset)}")
-print(f"  Vocabulary size: {len(vocab)}")
-print(f"  Expected captions: ~40,456 (8,091 images × 5 captions)")
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Dry-run dataset test")
+    parser.add_argument("--data_root", default="data")
+    parser.add_argument("--num_samples", type=int, default=5)
+    args = parser.parse_args()
 
-if len(dataset) > 40000:
-    print(f"\n✓ Dataset size looks correct!")
-elif len(dataset) > 0:
-    print(f"\n⚠ Dataset size is lower than expected.")
-    print(f"  This might be okay if you're using a subset.")
-else:
-    print(f"\n✗ Dataset is empty!")
-
-print("\n" + "=" * 70)
-print("🎉 DIAGNOSTIC TEST COMPLETE!")
-print("=" * 70)
-print("\nYour dataset is ready for training!")
-print("\nNext steps:")
-print("  1. Run: python train.py")
-print("  2. Monitor the training loss")
-print("  3. Use saved model for inference")
-print("\n" + "=" * 70)
+    ok = run_test(args.data_root, args.num_samples)
+    sys.exit(0 if ok else 1)

@@ -1,354 +1,383 @@
 """
 Training Script for Image Captioning
-
-This script trains the LSTM decoder on Flickr8k dataset.
-
-Training Process Overview:
-1. Load and preprocess Flickr8k dataset
-2. Build vocabulary from captions
-3. Initialize encoder (frozen ResNet50) and decoder (trainable LSTM)
-4. Train decoder using teacher forcing
-5. Save trained model and vocabulary
-
-Key Concepts Explained:
-- Teacher Forcing: Feed actual previous word during training
-- Loss Function: CrossEntropyLoss measures prediction accuracy
-- Backpropagation: Update only decoder weights (encoder frozen)
-- Optimizer: Adam optimizer for efficient training
+=====================================
+End-to-end training on Flickr8k with:
+  • Mandatory dataset preparation (auto-detect, normalize, validate)
+  • YAML config + CLI overrides
+  • Train / val split with BLEU evaluation
+  • LR scheduling  (ReduceLROnPlateau)
+  • Early stopping
+  • Mixed-precision (AMP)
+  • Full checkpoint save / resume
 """
 
+import argparse
+import math
 import os
+import sys
+import yaml
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from models.encoder import Encoder
 from models.decoder import Decoder
 from utils.vocabulary import Vocabulary
-from utils.dataset import FlickrDataset, get_transform
+from utils.prepare_dataset import prepare_dataset, DatasetError
+from utils.dataset import (
+    load_caption_map,
+    split_dataset,
+    get_transform,
+    FlickrDataset,
+)
+from evaluate import evaluate_bleu, print_bleu
 
 
-def train_model(
-    data_dir="data",
-    num_epochs=10,
-    batch_size=32,
-    learning_rate=0.001,
-    embed_size=256,
-    hidden_size=512,
-    num_layers=1,
-    save_dir="saved_models"
-):
-    """
-    Main training function.
-    
-    Args:
-        data_dir (str): Path to data folder containing Flickr8k
-        num_epochs (int): Number of training epochs
-        batch_size (int): Number of samples per batch
-        learning_rate (float): Learning rate for optimizer
-        embed_size (int): Dimension of embeddings
-        hidden_size (int): LSTM hidden state size
-        num_layers (int): Number of LSTM layers
-        save_dir (str): Directory to save models
-    
-    Training Loop:
-        For each epoch:
-            For each batch:
-                1. Extract image features (encoder)
-                2. Generate caption predictions (decoder)
-                3. Calculate loss
-                4. Backpropagate
-                5. Update decoder weights
-    """
-    
-    # Create save directory
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Set device (GPU if available, else CPU)
+# ======================================================================
+# Config helpers
+# ======================================================================
+
+DEFAULT_CONFIG = {
+    "data_dir": "data",
+    "save_dir": "saved_models",
+    "num_epochs": 10,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "embed_size": 256,
+    "hidden_size": 512,
+    "num_layers": 1,
+    "dropout": 0.5,
+    "freq_threshold": 5,
+    "max_length": 50,
+    "beam_size": 3,
+    "early_stop_patience": 5,
+    "scheduler_patience": 2,
+    "use_amp": True,
+    "num_workers": 2,
+    "seed": 42,
+}
+
+
+def load_config(config_path=None):
+    cfg = dict(DEFAULT_CONFIG)
+    if config_path and os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            file_cfg = yaml.safe_load(f) or {}
+        cfg.update(file_cfg)
+        print(f"Config loaded from {config_path}")
+    return cfg
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train Image Captioning Model")
+    p.add_argument("--config", type=str, default="config.yaml")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint to resume from")
+    for k, v in DEFAULT_CONFIG.items():
+        if isinstance(v, bool):
+            p.add_argument(f"--{k}", type=str, default=None)
+        else:
+            p.add_argument(f"--{k}", type=type(v), default=None)
+    return p.parse_args()
+
+
+def apply_cli_overrides(cfg, args):
+    for k in DEFAULT_CONFIG:
+        v = getattr(args, k, None)
+        if v is not None:
+            if isinstance(DEFAULT_CONFIG[k], bool):
+                cfg[k] = str(v).lower() in ("true", "1", "yes")
+            else:
+                cfg[k] = v
+    return cfg
+
+
+# ======================================================================
+# Main training
+# ======================================================================
+
+def train_model(cfg, resume_path=None):
+
+    # ------------------------------------------------------------------
+    # 0. MANDATORY — Prepare & validate dataset  (THE GATE)
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 0 — DATASET PREPARATION  (mandatory)")
+    print("=" * 64)
+
+    try:
+        ds_stats = prepare_dataset(data_root=cfg["data_dir"])
+    except DatasetError as e:
+        print(str(e))
+        print("\n⛔ Training CANNOT start until the dataset is valid.")
+        print("   Fix the issue above and re-run.\n")
+        sys.exit(1)
+
+    img_dir = ds_stats["images_dir"]
+    captions_file = ds_stats["captions_file"]
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    torch.manual_seed(cfg["seed"])
+    os.makedirs(cfg["save_dir"], exist_ok=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # ========== STEP 1: Load Dataset ==========
-    print("\n" + "="*50)
-    print("STEP 1: Loading Dataset")
-    print("="*50)
-    
-    # Paths to Flickr8k data
-    img_dir = os.path.join(data_dir, "Flickr8k_Dataset")
-    captions_file = os.path.join(data_dir, "Flickr8k_text", "Flickr8k.token.txt")
-    
-    # Check if data exists
-    if not os.path.exists(img_dir):
-        print(f"\nERROR: Image directory not found: {img_dir}")
-        print("\nPlease download Flickr8k dataset:")
-        print("1. Download from: https://www.kaggle.com/datasets/adityajn105/flickr8k")
-        print("2. Extract to: data/Flickr8k_Dataset/")
-        return
-    
-    if not os.path.exists(captions_file):
-        print(f"\nERROR: Captions file not found: {captions_file}")
-        print("\nPlease ensure Flickr8k.token.txt is in: data/Flickr8k_text/")
-        return
-    
-    # ========== STEP 2: Build Vocabulary ==========
-    print("\n" + "="*50)
-    print("STEP 2: Building Vocabulary")
-    print("="*50)
-    
-    # Load all captions for vocabulary building
-    all_captions = []
-    with open(captions_file, 'r') as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) == 2:
-                all_captions.append(parts[1])
-    
-    print(f"Total captions: {len(all_captions)}")
-    
-    # Build vocabulary
-    # freq_threshold=5: Only include words appearing 5+ times
-    # This reduces vocabulary size and prevents overfitting on rare words
-    vocab = Vocabulary(freq_threshold=5)
-    vocab.build_vocabulary(all_captions)
-    
-    # Save vocabulary for later use (inference)
-    vocab_path = os.path.join(save_dir, "vocabulary.pkl")
-    vocab.save_vocabulary(vocab_path)
-    
-    # ========== STEP 3: Create DataLoader ==========
-    print("\n" + "="*50)
-    print("STEP 3: Creating DataLoader")
-    print("="*50)
-    
-    # Create dataset
-    dataset = FlickrDataset(
-        root_dir=img_dir,
-        captions_file=captions_file,
-        vocab=vocab,
-        transform=get_transform(train=True)
-    )
-    
-    # Create dataloader for batching
-    # shuffle=True: Randomize order each epoch
-    # num_workers=2: Parallel data loading
-    dataloader = DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True  # Faster GPU transfer
-    )
-    
-    print(f"Batches per epoch: {len(dataloader)}")
-    
-    # ========== STEP 4: Initialize Models ==========
-    print("\n" + "="*50)
-    print("STEP 4: Initializing Models")
-    print("="*50)
-    
-    # Create encoder (frozen ResNet50)
-    encoder = Encoder(embed_size=embed_size).to(device)
-    encoder.eval()  # Set to evaluation mode (frozen)
-    
-    # Create decoder (trainable LSTM)
-    decoder = Decoder(
-        embed_size=embed_size,
-        hidden_size=hidden_size,
-        vocab_size=len(vocab),
-        num_layers=num_layers
-    ).to(device)
-    decoder.train()  # Set to training mode
-    
-    # ========== STEP 5: Setup Training ==========
-    print("\n" + "="*50)
-    print("STEP 5: Setting Up Training")
-    print("="*50)
-    
-    # Loss function: CrossEntropyLoss
-    # Measures how well predicted words match actual words
-    # Ignores <pad> tokens in loss calculation
-    criterion = nn.CrossEntropyLoss(ignore_index=vocab.word2idx["<pad>"])
-    
-    # Optimizer: Adam
-    # Only update decoder parameters (encoder is frozen)
-    # Why Adam? Adaptive learning rates, works well for most tasks
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate)
-    
-    print(f"Loss function: CrossEntropyLoss")
-    print(f"Optimizer: Adam (lr={learning_rate})")
-    print(f"Only training decoder parameters (encoder frozen)")
-    
-    # ========== STEP 6: Training Loop ==========
-    print("\n" + "="*50)
-    print("STEP 6: Training")
-    print("="*50)
-    
-    # Track loss history for plotting
-    loss_history = []
-    
-    # Training loop
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        
-        # Progress bar for batches
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        
-        for batch_idx, (images, captions) in enumerate(pbar):
-            # Move data to device (GPU/CPU)
-            images = images.to(device)
-            captions = captions.to(device)
-            
-            # ===== Forward Pass =====
-            
-            # 1. Extract image features using encoder
-            # Shape: (batch_size, embed_size)
-            with torch.no_grad():  # No gradients for encoder
-                features = encoder(images)
-            
-            # 2. Generate predictions using decoder
-            # Shape: (batch_size, max_length, vocab_size)
-            outputs = decoder(features, captions)
-            
-            # 3. Prepare targets
-            # Remove first word (<start>) from captions
-            # We predict words 1 to N given words 0 to N-1
-            targets = captions[:, 1:]
-            
-            # Reshape for loss calculation
-            # outputs: (batch_size * max_length, vocab_size)
-            # targets: (batch_size * max_length)
-            outputs = outputs.reshape(-1, outputs.shape[2])
-            targets = targets.reshape(-1)
-            
-            # 4. Calculate loss
-            # How different are predictions from actual words?
-            loss = criterion(outputs, targets)
-            
-            # ===== Backward Pass =====
-            
-            # 5. Clear previous gradients
-            optimizer.zero_grad()
-            
-            # 6. Backpropagation
-            # Calculate gradients for all parameters
-            loss.backward()
-            
-            # 7. Update weights
-            # Only decoder weights are updated (encoder frozen)
-            optimizer.step()
-            
-            # Track loss
-            epoch_loss += loss.item()
-            
-            # Update progress bar
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
-        
-        # Average loss for epoch
-        avg_loss = epoch_loss / len(dataloader)
-        loss_history.append(avg_loss)
-        
-        print(f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.4f}")
-        
-        # Save checkpoint every epoch
-        checkpoint = {
-            'epoch': epoch + 1,
-            'encoder_state_dict': encoder.state_dict(),
-            'decoder_state_dict': decoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_loss,
-            'vocab_size': len(vocab),
-            'embed_size': embed_size,
-            'hidden_size': hidden_size,
-            'num_layers': num_layers
-        }
-        
-        checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
-    
-    # ========== STEP 7: Save Final Model ==========
-    print("\n" + "="*50)
-    print("STEP 7: Saving Final Model")
-    print("="*50)
-    
-    final_model_path = os.path.join(save_dir, "final_model.pth")
-    torch.save(checkpoint, final_model_path)
-    print(f"Final model saved: {final_model_path}")
-    
-    # ========== STEP 8: Plot Training Loss ==========
-    print("\n" + "="*50)
-    print("STEP 8: Plotting Training Loss")
-    print("="*50)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, num_epochs + 1), loss_history, marker='o')
-    plt.xlabel('Epoch')
-    plt.ylabel('Average Loss')
-    plt.title('Training Loss Over Time')
-    plt.grid(True)
-    
-    plot_path = os.path.join(save_dir, "training_loss.png")
-    plt.savefig(plot_path)
-    print(f"Loss plot saved: {plot_path}")
-    
-    print("\n" + "="*50)
-    print("Training Complete!")
-    print("="*50)
-    print(f"\nSaved files:")
-    print(f"  - Model: {final_model_path}")
-    print(f"  - Vocabulary: {vocab_path}")
-    print(f"  - Loss plot: {plot_path}")
+    use_amp = cfg["use_amp"] and device.type == "cuda"
+    print(f"Device: {device}  |  AMP: {use_amp}")
 
+    # ------------------------------------------------------------------
+    # 1. Load canonical captions & build vocabulary
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 1 — Vocabulary")
+    print("=" * 64)
+
+    caption_map = load_caption_map(captions_file)
+    all_captions = [c for caps in caption_map.values() for c in caps]
+    vocab = Vocabulary(freq_threshold=cfg["freq_threshold"])
+    vocab.build_vocabulary(all_captions)
+
+    vocab_path = os.path.join(cfg["save_dir"], "vocabulary.pkl")
+    vocab.save_vocabulary(vocab_path)
+
+    # ------------------------------------------------------------------
+    # 2. Split & DataLoaders
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 2 — Splits & DataLoaders")
+    print("=" * 64)
+
+    train_map, val_map, _test_map = split_dataset(caption_map, seed=cfg["seed"])
+
+    train_ds = FlickrDataset(img_dir, train_map, vocab,
+                             transform=get_transform(train=True),
+                             max_length=cfg["max_length"])
+    val_ds = FlickrDataset(img_dir, val_map, vocab,
+                           transform=get_transform(train=False),
+                           max_length=cfg["max_length"])
+
+    if len(train_ds) == 0:
+        print("❌ Training dataset is empty. Cannot proceed.")
+        sys.exit(1)
+    if len(val_ds) == 0:
+        print("❌ Validation dataset is empty. Cannot proceed.")
+        sys.exit(1)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
+                              shuffle=True, num_workers=cfg["num_workers"],
+                              pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"],
+                            shuffle=False, num_workers=cfg["num_workers"],
+                            pin_memory=True)
+
+    print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
+
+    # ------------------------------------------------------------------
+    # 3. Models
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 3 — Models")
+    print("=" * 64)
+
+    encoder = Encoder(embed_size=cfg["embed_size"]).to(device)
+    encoder.eval()
+
+    decoder = Decoder(
+        embed_size=cfg["embed_size"],
+        hidden_size=cfg["hidden_size"],
+        vocab_size=len(vocab),
+        num_layers=cfg["num_layers"],
+        dropout=cfg["dropout"],
+    ).to(device)
+
+    # ------------------------------------------------------------------
+    # 4. Optimizer / Scheduler / Scaler
+    # ------------------------------------------------------------------
+    criterion = nn.CrossEntropyLoss(ignore_index=vocab.word2idx["<pad>"])
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=cfg["learning_rate"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=cfg["scheduler_patience"],
+        factor=0.5, verbose=True)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    start_epoch = 0
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    # Resume
+    if resume_path and os.path.isfile(resume_path):
+        print(f"\n  Resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(ckpt["encoder_state_dict"])
+        decoder.load_state_dict(ckpt["decoder_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        print(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+
+    # ------------------------------------------------------------------
+    # 5. Training loop
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 4 — Training")
+    print("=" * 64)
+
+    train_losses, val_losses = [], []
+
+    for epoch in range(start_epoch, cfg["num_epochs"]):
+        decoder.train()
+        epoch_loss = 0.0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['num_epochs']}")
+        for batch_idx, (images, captions) in enumerate(pbar):
+            images, captions = images.to(device), captions.to(device)
+
+            with torch.no_grad():
+                features = encoder(images)
+
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                outputs = decoder(features, captions)
+                targets = captions[:, 1:]
+                loss = criterion(outputs.reshape(-1, outputs.size(2)),
+                                 targets.reshape(-1))
+
+            if math.isnan(loss.item()):
+                print(f"\n❌ NaN loss at epoch {epoch+1}, batch {batch_idx}. Aborting.")
+                return
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_train = epoch_loss / len(train_loader)
+        train_losses.append(avg_train)
+
+        # ---- Validation ----
+        decoder.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, captions in val_loader:
+                images, captions = images.to(device), captions.to(device)
+                features = encoder(images)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    outputs = decoder(features, captions)
+                    targets = captions[:, 1:]
+                    loss = criterion(outputs.reshape(-1, outputs.size(2)),
+                                     targets.reshape(-1))
+                val_loss += loss.item()
+        avg_val = val_loss / len(val_loader)
+        val_losses.append(avg_val)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"Epoch [{epoch+1}/{cfg['num_epochs']}]  "
+              f"Train: {avg_train:.4f}  Val: {avg_val:.4f}  LR: {lr_now:.6f}")
+
+        # BLEU every 3 epochs + last
+        if (epoch + 1) % 3 == 0 or (epoch + 1) == cfg["num_epochs"]:
+            try:
+                bleu = evaluate_bleu(encoder, decoder, val_ds, vocab, device, 200)
+                print_bleu(bleu, prefix=f"Epoch {epoch+1}")
+            except Exception as e:
+                print(f"  ⚠ BLEU eval skipped: {e}")
+
+        scheduler.step(avg_val)
+
+        # ---- Checkpoint ----
+        ckpt = {
+            "epoch": epoch + 1,
+            "encoder_state_dict": encoder.state_dict(),
+            "decoder_state_dict": decoder.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "train_loss": avg_train, "val_loss": avg_val,
+            "best_val_loss": best_val_loss,
+            "vocab_size": len(vocab),
+            "embed_size": cfg["embed_size"],
+            "hidden_size": cfg["hidden_size"],
+            "num_layers": cfg["num_layers"],
+            "config": cfg,
+        }
+        torch.save(ckpt, os.path.join(cfg["save_dir"], "checkpoint_latest.pth"))
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            ckpt["best_val_loss"] = best_val_loss
+            torch.save(ckpt, os.path.join(cfg["save_dir"], "best_model.pth"))
+            print(f"  ★ Best model saved (val_loss={best_val_loss:.4f})")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"  No improvement ({patience_counter}/{cfg['early_stop_patience']})")
+
+        if patience_counter >= cfg["early_stop_patience"]:
+            print(f"\n⏹ Early stopping after {epoch+1} epochs.")
+            break
+
+    # ------------------------------------------------------------------
+    # 6. Final evaluation
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 64)
+    print("  STEP 5 — Final Evaluation")
+    print("=" * 64)
+
+    best_path = os.path.join(cfg["save_dir"], "best_model.pth")
+    if os.path.isfile(best_path):
+        best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        decoder.load_state_dict(best_ckpt["decoder_state_dict"])
+        print(f"Loaded best model from epoch {best_ckpt['epoch']}")
+
+    try:
+        bleu = evaluate_bleu(encoder, decoder, val_ds, vocab, device, 500)
+        print_bleu(bleu, prefix="Final Val")
+    except Exception as e:
+        print(f"  ⚠ Final BLEU failed: {e}")
+
+    # Loss plot
+    try:
+        import matplotlib; matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(range(1, len(train_losses)+1), train_losses, "o-", label="Train")
+        ax.plot(range(1, len(val_losses)+1), val_losses, "s-", label="Val")
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
+        ax.set_title("Training & Validation Loss"); ax.legend(); ax.grid(True)
+        plot_path = os.path.join(cfg["save_dir"], "training_loss.png")
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+        print(f"Loss plot → {plot_path}")
+    except Exception:
+        pass
+
+    print("\n" + "=" * 64)
+    print("  ✅ Training Complete!")
+    print("=" * 64)
+    print(f"  Best model  : {best_path}")
+    print(f"  Vocabulary  : {vocab_path}")
+
+
+# ======================================================================
+# Entry point
+# ======================================================================
 
 if __name__ == "__main__":
-    """
-    Main entry point for training.
-    
-    To run:
-        python train.py
-    
-    Requirements:
-        1. Flickr8k dataset in data/Flickr8k_Dataset/
-        2. Captions file in data/Flickr8k_text/Flickr8k.token.txt
-    
-    Output:
-        - Trained model in saved_models/
-        - Vocabulary in saved_models/vocabulary.pkl
-        - Training loss plot
-    
-    Training Tips:
-        - Start with 5-10 epochs for testing
-        - Monitor loss - should decrease over time
-        - Training on CPU: ~30 min per epoch
-        - Training on GPU: ~5 min per epoch
-        - Use Google Colab for free GPU access
-    """
-    
-    print("="*50)
-    print("IMAGE CAPTIONING - TRAINING SCRIPT")
-    print("="*50)
-    print("\nThis script trains an LSTM decoder on Flickr8k dataset.")
-    print("The CNN encoder (ResNet50) is pre-trained and frozen.")
-    print("Only the LSTM decoder is trained from scratch.")
-    print("\n" + "="*50)
-    
-    # Training configuration
-    config = {
-        "data_dir": "data",
-        "num_epochs": 10,          # Increase for better results
-        "batch_size": 32,          # Reduce if out of memory
-        "learning_rate": 0.001,
-        "embed_size": 256,
-        "hidden_size": 512,
-        "num_layers": 1,
-        "save_dir": "saved_models"
-    }
-    
-    print("\nTraining Configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    
-    # Start training
-    train_model(**config)
+    print("=" * 64)
+    print("  IMAGE CAPTIONING — TRAINING")
+    print("=" * 64)
+
+    args = parse_args()
+    cfg = load_config(args.config)
+    cfg = apply_cli_overrides(cfg, args)
+
+    print("\nConfiguration:")
+    for k, v in sorted(cfg.items()):
+        print(f"  {k}: {v}")
+
+    train_model(cfg, resume_path=args.resume)
